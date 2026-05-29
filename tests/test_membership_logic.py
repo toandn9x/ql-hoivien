@@ -123,11 +123,13 @@ def test_build_alert_message_changes_for_expired_members():
 
 def test_admin_expiring_email_body_lists_members():
     member = MemberSnapshot(2, "Nguyen Van A", "3", "0909", "", "", "", date(2026, 5, 29), date(2026, 6, 1), "Sắp hết hạn", "3 ngày", 3, "")
+    config = RuntimeConfig(google_service_account_json="credentials.json", google_sheet_url="https://docs.google.com/spreadsheets/d/test/edit")
     subject = build_admin_expiring_subject([member], 3)
-    body = build_admin_expiring_email_body([member], 3)
+    body = build_admin_expiring_email_body(config, [member], 3)
     assert subject == "Danh sách hội viên sắp hết hạn trong 3 ngày (1)"
     assert "Nguyen Van A" in body
     assert "2026-06-01" in body
+    assert "https://docs.google.com/spreadsheets/d/test/edit" in body
 
 
 def test_filter_expiring_members_only_keeps_members_in_range():

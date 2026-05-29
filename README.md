@@ -39,9 +39,24 @@ File `requirements.txt` chứa toàn bộ thư viện cần cho bot:
 1. Tạo Google Cloud service account và tải file JSON.
 2. Lưu file JSON vào thư mục dự án, ví dụ `credentials.json`.
 3. Điền `GOOGLE_SPREADSHEET_NAME` trong `.env`, ví dụ `ql-hoivien`.
-4. Bot sẽ tự mở Google Sheet theo tên đó. Nếu chưa có, bot tự tạo file mới trong Drive của service account.
+4. Điền `GOOGLE_SHEET_URL` nếu muốn email cảnh báo có link mở nhanh Google Sheet.
+5. Bot sẽ tự mở Google Sheet theo tên đó. Nếu chưa có, bot tự tạo file mới trong Drive của service account.
 
 Bạn có thể dùng lại file `credentials.json` từ dự án khác. Chỉ cần dùng một tên spreadsheet khác trong `GOOGLE_SPREADSHEET_NAME` để tách dữ liệu. Nếu bạn tự tạo Google Sheet bằng tài khoản cá nhân, hãy share sheet đó cho email service account với quyền Editor.
+
+Ví dụ cấu hình link Google Sheet trong `.env`:
+
+```env
+GOOGLE_SHEET_URL=https://docs.google.com/spreadsheets/d/xxxxxxxx/edit
+```
+
+Không cần đặt link trong ngoặc kép. Chỉ dùng ngoặc kép nếu URL có khoảng trắng hoặc ký tự đặc biệt:
+
+```env
+GOOGLE_SHEET_URL="https://docs.google.com/spreadsheets/d/xxxxxxxx/edit"
+```
+
+Nếu dùng `GOOGLE_SHEET_ID`, bot có thể tự dựng link Google Sheet từ ID. Nếu chỉ dùng `GOOGLE_SPREADSHEET_NAME`, nên điền thêm `GOOGLE_SHEET_URL` để email có link đối soát.
 
 Bot sẽ tự tạo hoặc cập nhật worksheet/tab tên `HoiVien` với các cột:
 
@@ -106,23 +121,48 @@ Bot dùng Telegram polling nên vẫn chỉ chạy một port duy nhất cho hea
 /start
 ```
 
-Nếu muốn chỉ cho một vài chat được nhập dữ liệu, điền chat ID vào `.env`:
+### Phân quyền admin
+
+Các lệnh thay đổi dữ liệu và cấu hình (`/add`, `/renew`, `/huy`, `/addemail`, `/addchatid`, `/senddigest`, `/sendstats`, `/testalert`) chỉ dùng trong chat riêng với bot và chỉ dành cho admin. Điền User ID admin vào:
 
 ```env
-TELEGRAM_ALLOWED_CHAT_IDS=123456789,987654321
+TELEGRAM_ADMIN_CHAT_IDS=123456789
 ```
 
-Nếu muốn gửi digest danh sách hội viên sắp hết hạn vào group Telegram hằng ngày, thêm bot vào group rồi gửi `/id` trong group để lấy chat ID. Sau đó cấu hình:
+Nếu `TELEGRAM_ADMIN_CHAT_IDS` để trống, các lệnh thay đổi dữ liệu/cấu hình sẽ bị chặn. Gửi `/id` trong chat riêng với bot để lấy User ID admin.
+
+Nếu muốn gửi thông báo tự động vào group Telegram, thêm bot vào group rồi gửi `/id` trong group để lấy group chat ID. Sau đó cấu hình:
 
 ```env
 TELEGRAM_DIGEST_CHAT_IDS=-1001234567890
-TELEGRAM_DIGEST_RUN_TIME=09:00
+SCHEDULE_RUN_TIMES=07:00,18:00
 TELEGRAM_DIGEST_DAYS=3
 ```
 
 - `TELEGRAM_DIGEST_CHAT_IDS`: chat ID group nhận thông báo, có thể nhập nhiều ID bằng dấu phẩy.
-- `TELEGRAM_DIGEST_RUN_TIME`: giờ gửi hằng ngày dạng `HH:MM`. Để trống nếu không muốn gửi tự động.
+- `SCHEDULE_RUN_TIMES`: các giờ gửi thông báo trong ngày, dạng `HH:MM`, cách nhau bằng dấu phẩy. Ví dụ `07:00,18:00` để gửi lúc 7 giờ sáng và 6 giờ chiều. Để trống nếu không muốn gửi tự động.
 - `TELEGRAM_DIGEST_DAYS`: số ngày nhìn trước để lọc hội viên sắp hết hạn.
+
+Admin cũng có thể nhắn riêng cho bot để thêm group nhận thông báo:
+
+```text
+/addchatid -1001234567890
+```
+
+Mỗi lần chạy theo lịch, bot gửi **2 message độc lập** vào group:
+
+1. **Thống kê nhanh**: tổng số hội viên, phân theo trạng thái (còn hạn / sắp hết hạn / hết hạn / đã hủy).
+2. **Danh sách sắp hết hạn**: các hội viên hết hạn trong `TELEGRAM_DIGEST_DAYS` ngày tới.
+
+Mỗi khung giờ chỉ gửi đúng 1 lần/ngày, tự reset sang ngày mới.
+
+Trong group Telegram:
+
+- `/id`: xem group chat ID và user ID của người gửi.
+- `/list`, `/active`, `/expiring`, `/expired`, `/cancelled`, `/search`, `/stats`: xem thông tin hội viên ngay trong group.
+- Bot tự gửi thống kê và danh sách sắp hết hạn vào group theo `SCHEDULE_RUN_TIMES`.
+
+Group không xử lý `/add`, `/renew`, `/huy` hoặc các lệnh cấu hình/test. Các lệnh đó phải nhắn riêng cho bot bằng tài khoản admin đã cấu hình.
 
 Các trường bắt buộc khi nhập hội viên được cấu hình trong `.env`:
 
@@ -143,7 +183,7 @@ Mapping key trong `.env`:
 | `months` | Gói đăng ký |
 | `note` | Ghi chú |
 
-Menu và kiểm tra trạng thái:
+Menu trong chat riêng với bot:
 
 ```text
 /add
@@ -161,13 +201,14 @@ Menu và kiểm tra trạng thái:
 /addchatid
 /addemail
 /senddigest
+/sendstats
 /testalert
 /history Nguyễn Văn A
 /health
 /stats
 ```
 
-Bot tự đăng ký danh sách lệnh với Telegram khi khởi động, nên Telegram Desktop/PC có thể mở menu lệnh của bot mà không cần tự gõ từng lệnh.
+Bot tự đăng ký danh sách lệnh với Telegram khi khởi động. Telegram Desktop/PC sẽ hiện menu khác nhau theo nơi dùng: group chỉ hiện lệnh xem thông tin, chat riêng hiện đầy đủ lệnh quản trị.
 
 Xem danh sách hội viên:
 
@@ -189,11 +230,18 @@ Xem danh sách hội viên:
 - `/search <từ khóa>`: tìm theo tên, SĐT, gói đăng ký hoặc ghi chú.
 - `/health`: xem trạng thái bot và lần sync gần nhất.
 - `/stats`: xem tổng số hội viên theo trạng thái.
+- `/history <tên hoặc SĐT>`: xem lịch sử gia hạn.
+
+Lệnh quản trị chỉ dùng trong chat riêng với bot và yêu cầu User ID nằm trong `TELEGRAM_ADMIN_CHAT_IDS`:
+
+- `/add`: thêm hội viên.
+- `/renew`: gia hạn/nâng cấp/hạ cấp hội viên.
+- `/huy`: hủy hội viên.
 - `/testalert`: gửi email thử cho quản trị, nội dung là danh sách hội viên sắp hết hạn.
 - `/addchatid`: thêm group chat ID vào `TELEGRAM_DIGEST_CHAT_IDS` trong `.env`.
 - `/addemail`: thêm email người nhận cảnh báo vào `.env`.
 - `/senddigest`: gửi ngay danh sách hội viên sắp hết hạn vào các group trong `TELEGRAM_DIGEST_CHAT_IDS`.
-- `/history <tên hoặc SĐT>`: xem lịch sử gia hạn.
+- `/sendstats`: gửi ngay thống kê hội viên vào các group trong `TELEGRAM_DIGEST_CHAT_IDS`.
 
 Lưu ý: `/testalert` chỉ gửi email khi `SMTP_USER`, `SMTP_PASSWORD` và `ALERT_EMAIL_TO` đã được cấu hình.
 `/addemail` sẽ tự cập nhật dòng `ALERT_EMAIL_TO=` trong file `.env` ngay khi bạn nhập email hợp lệ.

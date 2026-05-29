@@ -83,6 +83,7 @@ COLORS = {
 class RuntimeConfig:
     google_service_account_json: str
     google_sheet_id: str = ""
+    google_sheet_url: str = ""
     google_spreadsheet_name: str = "ql-hoivien"
     check_interval_minutes: int = 5
     alert_before_days: int = 3
@@ -93,10 +94,10 @@ class RuntimeConfig:
     smtp_user: str = ""
     smtp_password: str = ""
     telegram_bot_token: str = ""
-    telegram_allowed_chat_ids: tuple[str, ...] = ()
+    telegram_admin_chat_ids: tuple[str, ...] = ()
     telegram_add_required_fields: tuple[str, ...] = ("member_name", "months")
     telegram_digest_chat_ids: tuple[str, ...] = ()
-    telegram_digest_run_time: datetime_time | None = None
+    schedule_run_times: tuple[datetime_time, ...] = ()
     telegram_digest_days: int = 3
     discord_webhook_url: str = ""
     port: int = 8687
@@ -165,7 +166,31 @@ RENEW_FIELDS = [
     AddField("months", "Gói đăng ký", "Nhập số tháng gia hạn:"),
     AddField("amount", "Số tiền", "Nhập số tiền gia hạn:"),
 ]
-SKIP_VALUES = {"", "-", "/skip", "skip", "bo qua", "bỏ qua"}
+GROUP_READ_COMMANDS = {
+    "/start",
+    "/help",
+    "/menu",
+    "/id",
+    "/health",
+    "/status",
+    "/list",
+    "/members",
+    "/ds",
+    "/danhsach",
+    "/active",
+    "/conhan",
+    "/expiring",
+    "/soon",
+    "/saphethan",
+    "/expired",
+    "/het",
+    "/hethan",
+    "/cancelled",
+    "/dahuy",
+    "/search",
+    "/stats",
+    "/history",
+}
 
 
 last_sync: dict[str, Any] = {
@@ -189,6 +214,7 @@ app = FastAPI(title="Hoi Vien Membership Bot")
 def load_config() -> RuntimeConfig:
     return RuntimeConfig(
         google_sheet_id=os.getenv("GOOGLE_SHEET_ID", "").strip(),
+        google_sheet_url=os.getenv("GOOGLE_SHEET_URL", "").strip(),
         google_spreadsheet_name=os.getenv("GOOGLE_SPREADSHEET_NAME", "ql-hoivien").strip() or "ql-hoivien",
         google_service_account_json=require_env("GOOGLE_SERVICE_ACCOUNT_JSON"),
         check_interval_minutes=int(os.getenv("CHECK_INTERVAL_MINUTES", "5")),
@@ -200,10 +226,10 @@ def load_config() -> RuntimeConfig:
         smtp_user=os.getenv("SMTP_USER", ""),
         smtp_password=os.getenv("SMTP_PASSWORD", ""),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
-        telegram_allowed_chat_ids=parse_csv_env("TELEGRAM_ALLOWED_CHAT_IDS"),
+        telegram_admin_chat_ids=parse_csv_env("TELEGRAM_ADMIN_CHAT_IDS"),
         telegram_add_required_fields=parse_required_add_fields(os.getenv("TELEGRAM_ADD_REQUIRED_FIELDS", "")),
         telegram_digest_chat_ids=parse_csv_env("TELEGRAM_DIGEST_CHAT_IDS"),
-        telegram_digest_run_time=parse_alert_run_time(os.getenv("TELEGRAM_DIGEST_RUN_TIME", "").strip()),
+        schedule_run_times=parse_run_times(os.getenv("SCHEDULE_RUN_TIMES", "")),
         telegram_digest_days=int(os.getenv("TELEGRAM_DIGEST_DAYS", os.getenv("ALERT_BEFORE_DAYS", "3"))),
         discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", ""),
         port=int(os.getenv("PORT", "8687")),
@@ -224,6 +250,10 @@ def parse_csv_env(name: str) -> tuple[str, ...]:
 
 def read_alert_email_recipients() -> tuple[str, ...]:
     return parse_csv_value(os.getenv("ALERT_EMAIL_TO", ""))
+
+
+def read_telegram_digest_chat_ids() -> tuple[str, ...]:
+    return parse_csv_value(os.getenv("TELEGRAM_DIGEST_CHAT_IDS", ""))
 
 
 def parse_csv_value(value: str) -> tuple[str, ...]:
@@ -253,6 +283,19 @@ def parse_alert_run_time(value: str) -> datetime_time | None:
         return datetime.strptime(value, "%H:%M").time()
     except ValueError as exc:
         raise RuntimeError(f"ALERT_RUN_TIME must use HH:MM format, got: {value}") from exc
+
+
+def parse_run_times(value: str) -> tuple[datetime_time, ...]:
+    times = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            times.append(datetime.strptime(part, "%H:%M").time())
+        except ValueError:
+            logger.warning("Invalid time in SCHEDULE_RUN_TIMES, skipping: %s", part)
+    return tuple(times)
 
 
 def parse_date(value: Any) -> date | None:
@@ -433,6 +476,14 @@ def get_spreadsheet(client: gspread.Client, config: RuntimeConfig) -> gspread.Sp
         return client.create(config.google_spreadsheet_name)
 
 
+def resolve_google_sheet_url(config: RuntimeConfig) -> str:
+    if config.google_sheet_url:
+        return config.google_sheet_url
+    if config.google_sheet_id:
+        return f"https://docs.google.com/spreadsheets/d/{config.google_sheet_id}/edit"
+    return ""
+
+
 def sync_sheet(config: RuntimeConfig) -> dict[str, Any]:
     with sheet_lock:
         return sync_sheet_unlocked(config)
@@ -583,6 +634,13 @@ def load_member_snapshots(config: RuntimeConfig) -> list[MemberSnapshot]:
             )
         )
     return snapshots
+
+
+def find_member_by_code(config: RuntimeConfig, member_code: str) -> MemberSnapshot | None:
+    code = normalize_member_code(member_code)
+    if not code:
+        return None
+    return next((s for s in load_member_snapshots(config) if s.member_code == code), None)
 
 
 def sort_member_snapshots(members: list[MemberSnapshot]) -> list[MemberSnapshot]:
@@ -862,7 +920,7 @@ def handle_history_command(config: RuntimeConfig, payload: str) -> str:
             f"{fixed_width(str(row.get('Ngày hết hạn mới', '') or '-'), 10)} "
             f"{fixed_width(str(row.get('Số tiền', '') or '-'), 10)}"
         )
-    return f"Lịch sử gia hạn: {query} ({len(matched)})\n<pre>{html.escape(chr(10).join(table_lines))}</pre>"
+    return f"Lịch sử gia hạn: {html.escape(query)} ({len(matched)})\n<pre>{html.escape(chr(10).join(table_lines))}</pre>"
 
 
 def should_alert(config: RuntimeConfig, state: MembershipState, alert_value: str) -> bool:
@@ -883,9 +941,27 @@ def is_alert_time(config: RuntimeConfig, current_time: datetime_time) -> bool:
     return current_time >= config.alert_run_time
 
 
+def is_admin(config: RuntimeConfig, chat_id: str) -> bool:
+    if not config.telegram_admin_chat_ids:
+        return False
+    return chat_id in config.telegram_admin_chat_ids
+
+
+def is_group_chat(chat_id: str) -> bool:
+    return chat_id.startswith("-")
+
+
+def private_admin_required_text(sender_id: str) -> str:
+    return (
+        "Lệnh này chỉ dùng trong chat riêng với bot và chỉ dành cho admin đã cấu hình.\n"
+        "Hãy nhắn riêng cho bot và điền User ID của admin vào TELEGRAM_ADMIN_CHAT_IDS.\n"
+        f"User ID của bạn: {sender_id or '-'}"
+    )
+
+
 def send_alerts(config: RuntimeConfig, row: dict[str, Any], state: MembershipState) -> list[str]:
     member_name = str(row.get("Họ tên", "")).strip()
-    message = build_alert_message(member_name, state)
+    message = build_alert_message(member_name, state, resolve_google_sheet_url(config))
     sent_channels: list[str] = []
     note = str(row.get("Ghi chú", "") or "")
 
@@ -939,7 +1015,7 @@ def handle_test_alert_command(config: RuntimeConfig, chat_id: str, payload: str)
     snapshots = load_member_snapshots(config)
     expiring_members = filter_expiring_members(snapshots, days)
     subject = build_admin_expiring_subject(expiring_members, days)
-    body = build_admin_expiring_email_body(expiring_members, days)
+    body = build_admin_expiring_email_body(config, expiring_members, days)
     sent: list[str] = []
     for recipient in recipients:
         try:
@@ -973,18 +1049,22 @@ def extract_telegram_chat_id(row: dict[str, Any]) -> str:
     return extract_note_value(note, "telegram")
 
 
-def build_alert_message(member_name: str, state: MembershipState) -> str:
+def build_alert_message(member_name: str, state: MembershipState, sheet_url: str = "") -> str:
     if state.status == "Hết hạn":
-        return (
+        message = (
             f"Hội viên {member_name} đã hết hạn. "
             f"Ngày hết hạn: {format_date(state.end_date)}. "
             f"Thời hạn còn lại: {state.remaining}."
         )
-    return (
-        f"Hội viên {member_name} sắp hết hạn. "
-        f"Ngày hết hạn: {format_date(state.end_date)}. "
-        f"Thời hạn còn lại: {state.remaining}."
-    )
+    else:
+        message = (
+            f"Hội viên {member_name} sắp hết hạn. "
+            f"Ngày hết hạn: {format_date(state.end_date)}. "
+            f"Thời hạn còn lại: {state.remaining}."
+        )
+    if sheet_url:
+        message = f"{message}\n\nGoogle Sheet: {sheet_url}"
+    return message
 
 
 def filter_expiring_members(members: list[MemberSnapshot], days: int) -> list[MemberSnapshot]:
@@ -1001,33 +1081,33 @@ def build_admin_expiring_subject(members: list[MemberSnapshot], days: int) -> st
     return f"Danh sách hội viên sắp hết hạn trong {days} ngày ({len(members)})"
 
 
-def build_admin_expiring_email_body(members: list[MemberSnapshot], days: int) -> str:
+def build_admin_expiring_email_body(config: RuntimeConfig, members: list[MemberSnapshot], days: int) -> str:
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sheet_url = resolve_google_sheet_url(config)
     lines = [
-        f"Danh sách hội viên sắp hết hạn trong {days} ngày.",
-        f"Thời điểm tạo: {generated_at}",
-        f"Tổng số: {len(members)}",
+        f"DANH SACH HOI VIEN SAP HET HAN TRONG {days} NGAY",
+        f"Thoi diem tao : {generated_at}",
+        f"Tong so       : {len(members)}",
+        f"Google Sheet  : {sheet_url or 'Chua cau hinh GOOGLE_SHEET_URL hoac GOOGLE_SHEET_ID'}",
         "",
     ]
     if not members:
         lines.append("Hiện không có hội viên nào sắp hết hạn trong ngưỡng này.")
         return "\n".join(lines)
 
-    lines.append("STT | Mã HV | Họ tên | Gói | Ngày hết hạn | Còn lại | SĐT")
-    lines.append("-" * 82)
+    lines.append(
+        f"{'STT':>3}  {'Ma HV':<8}  {'Ho ten':<24}  {'Goi':<5}  {'Het han':<10}  {'Con lai':<16}  {'SDT':<12}"
+    )
+    lines.append("-" * 92)
     for index, member in enumerate(members, start=1):
         lines.append(
-            " | ".join(
-                [
-                    str(index),
-                    member.member_code or "-",
-                    member.name,
-                    member.package or "-",
-                    format_date(member.end_date) or "-",
-                    member.remaining or "-",
-                    member.phone or "-",
-                ]
-            )
+            f"{index:>3}  "
+            f"{fixed_width(member.member_code or '-', 8)}  "
+            f"{fixed_width(member.name, 24)}  "
+            f"{fixed_width(member.package or '-', 5)}  "
+            f"{fixed_width(format_date(member.end_date) or '-', 10)}  "
+            f"{fixed_width(member.remaining or '-', 16)}  "
+            f"{fixed_width(member.phone or '-', 12)}"
         )
     return "\n".join(lines)
 
@@ -1099,7 +1179,7 @@ def telegram_api(config: RuntimeConfig, method: str, payload: dict[str, Any]) ->
 
 
 def telegram_set_commands(config: RuntimeConfig) -> None:
-    commands = [
+    private_commands = [
         {"command": "menu", "description": "Mở menu quản lý"},
         {"command": "help", "description": "Xem hướng dẫn sử dụng"},
         {"command": "add", "description": "Thêm hội viên"},
@@ -1115,12 +1195,29 @@ def telegram_set_commands(config: RuntimeConfig) -> None:
         {"command": "addchatid", "description": "Thêm group chat ID"},
         {"command": "addemail", "description": "Thêm email nhận cảnh báo"},
         {"command": "senddigest", "description": "Gửi danh sách sắp hết hạn vào group"},
+        {"command": "sendstats", "description": "Gửi thống kê hội viên vào group"},
         {"command": "testalert", "description": "Gửi cảnh báo thử"},
         {"command": "history", "description": "Xem lịch sử gia hạn"},
         {"command": "health", "description": "Kiểm tra trạng thái bot"},
         {"command": "stats", "description": "Xem thống kê hội viên"},
     ]
-    telegram_api(config, "setMyCommands", {"commands": commands})
+    group_commands = [
+        {"command": "menu", "description": "Mở menu xem thông tin"},
+        {"command": "help", "description": "Xem hướng dẫn trong group"},
+        {"command": "list", "description": "Xem danh sách hội viên"},
+        {"command": "active", "description": "Xem hội viên còn hạn"},
+        {"command": "expiring", "description": "Xem hội viên sắp hết hạn"},
+        {"command": "expired", "description": "Xem hội viên đã hết hạn"},
+        {"command": "cancelled", "description": "Xem hội viên đã hủy"},
+        {"command": "search", "description": "Tìm hội viên"},
+        {"command": "history", "description": "Xem lịch sử gia hạn"},
+        {"command": "stats", "description": "Xem thống kê hội viên"},
+        {"command": "health", "description": "Kiểm tra trạng thái bot"},
+        {"command": "id", "description": "Xem group chat ID và user ID"},
+    ]
+    telegram_api(config, "setMyCommands", {"commands": group_commands})
+    telegram_api(config, "setMyCommands", {"commands": private_commands, "scope": {"type": "all_private_chats"}})
+    telegram_api(config, "setMyCommands", {"commands": group_commands, "scope": {"type": "all_group_chats"}})
 
 
 def telegram_get_updates(config: RuntimeConfig, offset: int | None) -> list[dict[str, Any]]:
@@ -1147,62 +1244,100 @@ def telegram_loop(config: RuntimeConfig) -> None:
                 message = update.get("message") or {}
                 chat = message.get("chat") or {}
                 chat_id = str(chat.get("id", ""))
+                sender_id = str((message.get("from") or {}).get("id", ""))
                 text = str(message.get("text", "") or "")
                 if not chat_id or not text:
                     continue
-                if config.telegram_allowed_chat_ids and chat_id not in config.telegram_allowed_chat_ids:
-                    logger.warning("Ignoring Telegram message from unauthorized chat_id=%s", chat_id)
-                    continue
-                reply = handle_telegram_command(config, chat_id, text)
-                telegram_reply(config, chat_id, reply.text, reply.reply_markup)
+                try:
+                    reply = handle_telegram_command(config, chat_id, sender_id or chat_id, text)
+                    telegram_reply(config, chat_id, reply.text, reply.reply_markup)
+                except Exception:
+                    logger.exception("Failed to handle command from chat_id=%s text=%r", chat_id, text)
+                    try:
+                        telegram_reply(config, chat_id, "Đã xảy ra lỗi khi xử lý lệnh. Vui lòng thử lại sau.")
+                    except Exception:
+                        pass
         except Exception:
             logger.exception("Telegram polling failed")
             time.sleep(10)
 
 
-def handle_telegram_command(config: RuntimeConfig, chat_id: str, text: str) -> TelegramReply:
+def handle_telegram_command(config: RuntimeConfig, chat_id: str, sender_id: str, text: str) -> TelegramReply:
     command_text = text.lstrip()
     command, _, raw_payload = command_text.partition(" ")
     command = command.split("@", 1)[0].lower()
     payload = raw_payload.strip()
+    skey = sender_id or chat_id  # session key theo user cá nhân, không theo group
+    group_chat = is_group_chat(chat_id)
 
-    if command == "/cancel":
-        if has_email_session(chat_id):
-            return TelegramReply(cancel_email_session(chat_id), telegram_menu_markup())
-        if has_chatid_session(chat_id):
-            return TelegramReply(cancel_chatid_session(chat_id), telegram_menu_markup())
-        if has_renew_session(chat_id):
-            return TelegramReply(cancel_renew_session(chat_id), telegram_menu_markup())
-        return TelegramReply(cancel_add_session(chat_id), telegram_menu_markup())
-    if has_email_session(chat_id):
-        return TelegramReply(handle_email_session_input(config, chat_id, text), telegram_menu_markup())
-    if has_chatid_session(chat_id):
-        return TelegramReply(handle_chatid_session_input(config, chat_id, text), telegram_menu_markup())
-    if has_renew_session(chat_id):
-        return TelegramReply(handle_renew_session_input(config, chat_id, text), renew_session_markup(config, chat_id))
-    if has_add_session(chat_id):
-        return TelegramReply(handle_add_session_input(config, chat_id, text), add_session_markup(config, chat_id))
+    if group_chat and command not in GROUP_READ_COMMANDS:
+        return TelegramReply(
+            "Trong group bot chỉ hỗ trợ xem thông tin và nhận thông báo tự động.\n"
+            "Các lệnh thêm/gia hạn/hủy/cấu hình vui lòng nhắn riêng cho bot bằng tài khoản admin.",
+            telegram_group_menu_markup(),
+        )
+
+    if not group_chat and command == "/cancel":
+        if has_email_session(skey):
+            return TelegramReply(cancel_email_session(skey), telegram_menu_markup())
+        if has_chatid_session(skey):
+            return TelegramReply(cancel_chatid_session(skey), telegram_menu_markup())
+        if has_renew_session(skey):
+            return TelegramReply(cancel_renew_session(skey), telegram_menu_markup())
+        return TelegramReply(cancel_add_session(skey), telegram_menu_markup())
+    if not group_chat and has_email_session(skey):
+        return TelegramReply(handle_email_session_input(config, skey, text), telegram_menu_markup())
+    if not group_chat and has_chatid_session(skey):
+        return TelegramReply(handle_chatid_session_input(config, skey, text), telegram_menu_markup())
+    if not group_chat and has_renew_session(skey):
+        return TelegramReply(handle_renew_session_input(config, skey, text), renew_session_markup(config, skey))
+    if not group_chat and has_add_session(skey):
+        return TelegramReply(handle_add_session_input(config, skey, chat_id, text), add_session_markup(config, skey))
     if command == "/start":
-        return TelegramReply(telegram_start_text(chat_id), telegram_menu_markup())
+        return TelegramReply(telegram_group_start_text(chat_id) if group_chat else telegram_start_text(chat_id), telegram_group_menu_markup() if group_chat else telegram_menu_markup())
     if command in ("/help", "/menu"):
-        return TelegramReply(telegram_help_text(chat_id), telegram_menu_markup())
+        return TelegramReply(telegram_group_help_text(chat_id) if group_chat else telegram_help_text(chat_id), telegram_group_menu_markup() if group_chat else telegram_menu_markup())
     if command == "/id":
-        return TelegramReply(f"Telegram Chat ID của cuộc trò chuyện này: {chat_id}")
+        if sender_id and sender_id != chat_id:
+            return TelegramReply(
+                f"Chat ID (nhóm): {chat_id}\n"
+                f"User ID (cá nhân): {sender_id}\n"
+                "Dùng User ID để điền TELEGRAM_ADMIN_CHAT_IDS."
+            )
+        return TelegramReply(f"Chat ID / User ID: {chat_id}")
     if command in ("/health", "/status"):
         return TelegramReply(format_telegram_health_text())
     if command in ("/add", "/them"):
-        return TelegramReply(start_add_session(config, chat_id), add_session_markup(config, chat_id))
+        if group_chat or not is_admin(config, sender_id):
+            return TelegramReply(private_admin_required_text(sender_id))
+        return TelegramReply(start_add_session(config, skey), add_session_markup(config, skey))
     if command in ("/addemail", "/email", "/addalertemail"):
-        return TelegramReply(start_email_session(chat_id), email_session_markup())
+        if group_chat or not is_admin(config, sender_id):
+            return TelegramReply(private_admin_required_text(sender_id))
+        return TelegramReply(start_email_session(skey), email_session_markup())
     if command in ("/addchatid", "/addgroupid", "/groupid"):
-        return TelegramReply(start_chatid_session(chat_id), chatid_session_markup())
+        if group_chat or not is_admin(config, sender_id):
+            return TelegramReply(private_admin_required_text(sender_id))
+        return TelegramReply(handle_addchatid_command(config, chat_id, skey, payload), chatid_session_markup() if has_chatid_session(skey) else telegram_menu_markup())
     if command in ("/testalert", "/test", "/testnotify"):
+        if group_chat or not is_admin(config, sender_id):
+            return TelegramReply(private_admin_required_text(sender_id))
         return TelegramReply(handle_test_alert_command(config, chat_id, payload))
     if command in ("/senddigest", "/testdigest", "/digest"):
+        if group_chat or not is_admin(config, sender_id):
+            return TelegramReply(private_admin_required_text(sender_id))
         return TelegramReply(handle_send_digest_command(config))
+    if command in ("/sendstats", "/teststats"):
+        if group_chat or not is_admin(config, sender_id):
+            return TelegramReply(private_admin_required_text(sender_id))
+        return TelegramReply(handle_send_stats_command(config))
     if command in ("/renew", "/giahan"):
-        return TelegramReply(handle_renew_command(config, chat_id, payload), renew_session_markup(config, chat_id) if has_renew_session(chat_id) else None)
+        if group_chat or not is_admin(config, sender_id):
+            return TelegramReply(private_admin_required_text(sender_id))
+        return TelegramReply(handle_renew_command(config, skey, payload), renew_session_markup(config, skey) if has_renew_session(skey) else None)
     if command in ("/huy", "/cancelmember", "/cancelmembership"):
+        if group_chat or not is_admin(config, sender_id):
+            return TelegramReply(private_admin_required_text(sender_id))
         return TelegramReply(handle_cancel_member_command(config, chat_id, payload))
     if command == "/history":
         return TelegramReply(handle_history_command(config, payload))
@@ -1263,6 +1398,32 @@ def telegram_start_text(chat_id: str) -> str:
     )
 
 
+def telegram_group_start_text(chat_id: str) -> str:
+    return (
+        "Bot quản lý hội viên đang hoạt động trong group.\n"
+        "Group chỉ dùng để xem thông tin và nhận thông báo tự động. Các lệnh thêm/gia hạn/hủy cần nhắn riêng cho bot bằng tài khoản admin.\n\n"
+        f"Group Chat ID: {chat_id}"
+    )
+
+
+def telegram_group_help_text(chat_id: str) -> str:
+    return (
+        "Các lệnh dùng trong group:\n"
+        "/list - danh sách hội viên\n"
+        "/active - hội viên còn hạn\n"
+        "/expiring [ngày] - hội viên sắp hết hạn\n"
+        "/expired - hội viên đã hết hạn\n"
+        "/cancelled - hội viên đã hủy\n"
+        "/search <từ khóa> - tìm hội viên\n"
+        "/history <tên hoặc SĐT> - xem lịch sử gia hạn\n"
+        "/stats - thống kê nhanh\n"
+        "/health - trạng thái bot\n"
+        "/id - xem group chat ID và user ID\n\n"
+        "Group nhận thông báo tự động theo SCHEDULE_RUN_TIMES. Các lệnh /add, /renew, /huy và lệnh cấu hình chỉ dùng trong chat riêng với bot.\n\n"
+        f"Group Chat ID: {chat_id}"
+    )
+
+
 def telegram_menu_markup() -> dict[str, Any]:
     return {
         "keyboard": [
@@ -1274,8 +1435,24 @@ def telegram_menu_markup() -> dict[str, Any]:
             [{"text": "/search "}, {"text": "/history "}],
             [{"text": "/id"}],
             [{"text": "/addchatid"}, {"text": "/addemail"}],
-            [{"text": "/senddigest"}, {"text": "/testalert"}],
+            [{"text": "/senddigest"}, {"text": "/sendstats"}],
+            [{"text": "/testalert"}],
             [{"text": "/health"}, {"text": "/stats"}],
+            [{"text": "/help"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
+def telegram_group_menu_markup() -> dict[str, Any]:
+    return {
+        "keyboard": [
+            [{"text": "/list"}, {"text": "/active"}],
+            [{"text": "/expiring"}, {"text": "/expired"}],
+            [{"text": "/cancelled"}, {"text": "/stats"}],
+            [{"text": "/search "}, {"text": "/history "}],
+            [{"text": "/id"}, {"text": "/health"}],
             [{"text": "/help"}],
         ],
         "resize_keyboard": True,
@@ -1465,6 +1642,21 @@ def handle_chatid_session_input(config: RuntimeConfig, chat_id: str, text: str) 
     )
 
 
+def handle_addchatid_command(config: RuntimeConfig, chat_id: str, session_key: str, payload: str) -> str:
+    target_chat_id = payload.strip() or (chat_id if chat_id.startswith("-") else "")
+    if target_chat_id:
+        if not is_valid_chat_id(target_chat_id):
+            return "Chat ID không hợp lệ. Dùng /id trong group để lấy group chat ID."
+        updated = add_chatid_recipient_to_env(target_chat_id)
+        os.environ["TELEGRAM_DIGEST_CHAT_IDS"] = updated
+        return (
+            f"Đã thêm group chat ID: {target_chat_id}\n"
+            f"TELEGRAM_DIGEST_CHAT_IDS hiện tại: {updated}\n"
+            "Bạn có thể dùng /senddigest để test ngay. Job tự động sẽ dùng danh sách mới này."
+        )
+    return start_chatid_session(session_key)
+
+
 def is_valid_email(value: str) -> bool:
     text = value.strip()
     return "@" in text and "." in text and " " not in text
@@ -1579,6 +1771,22 @@ def handle_renew_session_input(config: RuntimeConfig, chat_id: str, text: str) -
     if field.key == "months" and value and parse_months(value) is None:
         return f"Gói đăng ký phải là số tháng hợp lệ.\n\n{current_renew_prompt(chat_id)}"
 
+    member_confirm = ""
+    if field.key == "member_code" and value:
+        member = find_member_by_code(config, value)
+        if member is None:
+            return (
+                f"Không tìm thấy mã hội viên: {value}\n"
+                "Kiểm tra lại mã hoặc /cancel để hủy."
+            )
+        member_confirm = (
+            f"Tìm thấy hội viên:\n"
+            f"- Tên: {member.name}\n"
+            f"- Gói hiện tại: {member.package or '-'}\n"
+            f"- Hết hạn: {format_date(member.end_date) or '-'}\n"
+            f"- Tình trạng: {member.status or '-'}\n"
+        )
+
     with renew_sessions_lock:
         session = renew_sessions.get(chat_id)
         if session is None:
@@ -1588,7 +1796,8 @@ def handle_renew_session_input(config: RuntimeConfig, chat_id: str, text: str) -
         if session.field_index < len(RENEW_FIELDS):
             next_field = RENEW_FIELDS[session.field_index]
             skip_note = "" if next_field.key in ("member_code", "months") else "\nNếu không nhập, hãy gõ dấu chấm (.) để bỏ qua."
-            return f"Đã lưu {field.label}.\n\n{next_field.prompt}{skip_note}"
+            prefix = f"{member_confirm}\n" if member_confirm else f"Đã lưu {field.label}.\n\n"
+            return f"{prefix}{next_field.prompt}{skip_note}"
         values = session.values.copy()
         renew_sessions.pop(chat_id, None)
 
@@ -1722,16 +1931,41 @@ def handle_stats_command(config: RuntimeConfig) -> str:
 def handle_send_digest_command(config: RuntimeConfig) -> str:
     if not config.telegram_bot_token:
         return "Chưa cấu hình TELEGRAM_BOT_TOKEN nên chưa gửi được Telegram digest."
-    if not config.telegram_digest_chat_ids:
+    chat_ids = read_telegram_digest_chat_ids() or config.telegram_digest_chat_ids
+    if not chat_ids:
         return "Chưa cấu hình TELEGRAM_DIGEST_CHAT_IDS. Vào group Telegram, gửi /id để lấy chat ID rồi điền vào .env."
 
-    sent, member_count = send_telegram_expiring_digest(config, config.telegram_digest_chat_ids)
+    sent, member_count = send_telegram_expiring_digest(config, chat_ids)
     if not sent:
         return "Không gửi được digest vào group. Kiểm tra TELEGRAM_DIGEST_CHAT_IDS và log bot."
     return (
         "Đã gửi danh sách hội viên sắp hết hạn vào group.\n"
         f"Group đã gửi: {', '.join(sent)}\n"
         f"Số hội viên trong danh sách: {member_count}"
+    )
+
+
+def handle_send_stats_command(config: RuntimeConfig) -> str:
+    if not config.telegram_bot_token:
+        return "Chưa cấu hình TELEGRAM_BOT_TOKEN nên chưa gửi được."
+    chat_ids = read_telegram_digest_chat_ids() or config.telegram_digest_chat_ids
+    if not chat_ids:
+        return "Chưa cấu hình TELEGRAM_DIGEST_CHAT_IDS. Vào group Telegram, gửi /id để lấy chat ID rồi điền vào .env."
+
+    snapshots = load_member_snapshots(config)
+    message = build_group_stats_message(snapshots)
+    sent: list[str] = []
+    for chat_id in chat_ids:
+        try:
+            telegram_reply(config, chat_id, message)
+            sent.append(chat_id)
+        except Exception:
+            logger.exception("Failed to send stats to chat_id=%s", chat_id)
+    if not sent:
+        return "Không gửi được thống kê vào group. Kiểm tra TELEGRAM_DIGEST_CHAT_IDS và log bot."
+    return (
+        "Đã gửi thống kê hội viên vào group.\n"
+        f"Group đã gửi: {', '.join(sent)}"
     )
 
 
@@ -1751,7 +1985,7 @@ def format_member_list(title: str, members: list[MemberSnapshot], limit: int) ->
     if total == 0:
         return f"{title}: không có dữ liệu."
 
-    lines = [f"{title} ({total})", format_telegram_member_table(members, limit)]
+    lines = [f"{html.escape(title)} ({total})", format_telegram_member_table(members, limit)]
 
     if total > limit:
         lines.append(f"... còn {total - limit} hội viên nữa")
@@ -1812,9 +2046,10 @@ def send_discord(webhook_url: str, message: str) -> None:
 
 
 def telegram_reply(config: RuntimeConfig, chat_id: str, text: str, reply_markup: dict[str, Any] | None = None) -> None:
+    use_html = "<pre>" in text or "<b>" in text
     for index, chunk in enumerate(split_telegram_message(text)):
         payload: dict[str, Any] = {"chat_id": chat_id, "text": chunk}
-        if "<pre>" in chunk:
+        if use_html:
             payload["parse_mode"] = "HTML"
         if index == 0 and reply_markup:
             payload["reply_markup"] = reply_markup
@@ -1856,32 +2091,62 @@ def worker_loop(config: RuntimeConfig) -> None:
         time.sleep(max(1, config.check_interval_minutes) * 60)
 
 
-def telegram_digest_loop(config: RuntimeConfig) -> None:
+def build_group_stats_message(members: list[MemberSnapshot]) -> str:
+    total = len(members)
+    active = sum(1 for m in members if m.status == "Còn hạn")
+    expiring = sum(1 for m in members if m.status == "Sắp hết hạn")
+    expired = sum(1 for m in members if m.status == "Hết hạn")
+    cancelled = sum(1 for m in members if m.status == "Đã hủy")
+    return (
+        f"Thống kê hội viên - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        f"- Tổng: {total}\n"
+        f"- Còn hạn: {active}\n"
+        f"- Sắp hết hạn: {expiring}\n"
+        f"- Hết hạn: {expired}\n"
+        f"- Đã hủy: {cancelled}"
+    )
+
+
+def scheduled_loop(config: RuntimeConfig) -> None:
     if not config.telegram_bot_token:
-        logger.info("Telegram bot token is empty; Telegram digest is disabled.")
+        logger.info("Telegram bot token is empty; scheduled tasks disabled.")
         return
-    if not config.telegram_digest_chat_ids:
-        logger.info("TELEGRAM_DIGEST_CHAT_IDS is empty; Telegram digest is disabled.")
-        return
-    if config.telegram_digest_run_time is None:
-        logger.info("TELEGRAM_DIGEST_RUN_TIME is empty; scheduled Telegram digest is disabled.")
+    if not config.schedule_run_times:
+        logger.info("SCHEDULE_RUN_TIMES is empty; scheduled tasks disabled.")
         return
 
-    last_sent_date: date | None = None
+    sent_slots: set[tuple[date, datetime_time]] = set()
     logger.info(
-        "Telegram digest scheduled at %s for chat IDs: %s",
-        config.telegram_digest_run_time.strftime("%H:%M"),
-        ",".join(config.telegram_digest_chat_ids),
+        "Scheduled tasks at %s. Telegram group IDs are read from TELEGRAM_DIGEST_CHAT_IDS.",
+        ", ".join(t.strftime("%H:%M") for t in config.schedule_run_times),
     )
     while True:
         try:
+            chat_ids = read_telegram_digest_chat_ids() or config.telegram_digest_chat_ids
+            if not chat_ids:
+                time.sleep(60)
+                continue
             now = datetime.now()
-            if now.time() >= config.telegram_digest_run_time and last_sent_date != now.date():
-                sent, member_count = send_telegram_expiring_digest(config, config.telegram_digest_chat_ids)
-                last_sent_date = now.date()
-                logger.info("Telegram digest sent to %s with %s members", sent, member_count)
+            today = now.date()
+            sent_slots = {slot for slot in sent_slots if slot[0] == today}
+            for run_time in config.schedule_run_times:
+                slot = (today, run_time)
+                if slot in sent_slots or now.time() < run_time:
+                    continue
+                snapshots = load_member_snapshots(config)
+                stats_msg = build_group_stats_message(snapshots)
+                expiring = filter_expiring_members(snapshots, config.telegram_digest_days)
+                digest_msg = build_telegram_expiring_digest(expiring, config.telegram_digest_days)
+                for chat_id in chat_ids:
+                    try:
+                        telegram_reply(config, chat_id, stats_msg)
+                        telegram_reply(config, chat_id, digest_msg)
+                    except Exception:
+                        logger.exception("Failed to send scheduled tasks to chat_id=%s", chat_id)
+                sent_slots.add(slot)
+                logger.info("Scheduled tasks sent for slot %s", slot)
         except Exception:
-            logger.exception("Telegram digest job failed")
+            logger.exception("Scheduled loop failed")
         time.sleep(60)
 
 
@@ -1898,316 +2163,6 @@ def root(page: int = 1) -> HTMLResponse:
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(page: int = 1) -> HTMLResponse:
     return HTMLResponse(render_member_dashboard(page))
-
-
-def render_admin_dashboard() -> str:
-    ok = last_sync.get("ok")
-    synced_at = str(last_sync.get("at") or "Chưa có lần sync nào")
-    message = last_sync.get("message")
-    status_text = "Đang chờ sync" if ok is None else "Hoạt động" if ok else "Có lỗi"
-    status_class = "waiting" if ok is None else "ok" if ok else "error"
-    page_updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    uptime_hint = "Auto refresh 30s"
-
-    rows = changed_rows = alerted_rows = "-"
-    last_error = "-"
-    status_source = "Chưa có lần sync nào"
-    detail = ""
-    if isinstance(message, dict):
-        rows = str(message.get("rows", "-"))
-        changed_rows = str(message.get("changed_rows", "-"))
-        alerted_rows = str(message.get("alerted_rows", "-"))
-        detail = html.escape(json.dumps(message, ensure_ascii=False, indent=2))
-        status_source = "Sync worker"
-    else:
-        detail = html.escape(str(message))
-        if ok is False:
-            last_error = html.escape(str(message))
-
-    return f"""<!doctype html>
-<html lang="vi">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="30">
-  <title>Quản lý bot hội viên</title>
-  <style>
-    :root {{
-      color-scheme: light;
-      --bg: #eef2f7;
-      --surface: #ffffff;
-      --surface-soft: #f8fafc;
-      --text: #0f172a;
-      --muted: #64748b;
-      --border: #d7dee8;
-      --border-strong: #c7d2e2;
-      --ok: #166534;
-      --ok-bg: #ecfdf3;
-      --warn: #92400e;
-      --warn-bg: #fffbeb;
-      --error: #b91c1c;
-      --error-bg: #fef2f2;
-      --accent: #1d4ed8;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      font-family: Inter, Segoe UI, Arial, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-    }}
-    main {{
-      width: min(1240px, calc(100% - 32px));
-      margin: 24px auto 28px;
-    }}
-    header {{
-      display: flex;
-      align-items: flex-end;
-      justify-content: space-between;
-      gap: 20px;
-      margin-bottom: 18px;
-      padding: 18px 20px;
-      background: linear-gradient(180deg, #fff 0%, #f8fbff 100%);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
-    }}
-    h1 {{
-      margin: 0 0 8px;
-      font-size: 24px;
-      line-height: 1.2;
-    }}
-    p {{ margin: 0; color: var(--muted); line-height: 1.45; }}
-    .meta {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 10px;
-    }}
-    .pill {{
-      display: inline-flex;
-      align-items: center;
-      min-height: 30px;
-      padding: 5px 10px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: #fff;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0;
-      white-space: nowrap;
-    }}
-    .badge {{
-      display: inline-flex;
-      align-items: center;
-      min-height: 38px;
-      padding: 8px 14px;
-      border-radius: 10px;
-      font-weight: 700;
-      white-space: nowrap;
-      border: 1px solid transparent;
-    }}
-    .badge.ok {{ color: var(--ok); background: var(--ok-bg); border-color: #bbf7d0; }}
-    .badge.waiting {{ color: var(--warn); background: var(--warn-bg); border-color: #fde68a; }}
-    .badge.error {{ color: var(--error); background: var(--error-bg); border-color: #fecaca; }}
-    .grid {{
-      display: grid;
-      grid-template-columns: repeat(12, minmax(0, 1fr));
-      gap: 12px;
-      margin-bottom: 12px;
-    }}
-    .card {{
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 16px;
-      box-shadow: 0 1px 1px rgba(15, 23, 42, 0.03);
-      min-height: 112px;
-    }}
-    .card.metric {{
-      grid-column: span 3;
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-    }}
-    .label {{
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      margin-bottom: 10px;
-    }}
-    .value {{
-      font-size: 26px;
-      font-weight: 700;
-      line-height: 1.2;
-      overflow-wrap: anywhere;
-    }}
-    .subvalue {{
-      margin-top: 8px;
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.45;
-    }}
-    .split {{
-      display: grid;
-      grid-template-columns: minmax(0, 1.45fr) minmax(320px, 0.85fr);
-      gap: 12px;
-      margin-top: 12px;
-    }}
-    .panel {{
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 18px;
-      box-shadow: 0 1px 1px rgba(15, 23, 42, 0.03);
-    }}
-    .panel h2 {{
-      margin: 0 0 12px;
-      font-size: 16px;
-    }}
-    pre {{
-      margin: 0;
-      padding: 14px;
-      border-radius: 10px;
-      background: #0b1220;
-      color: #e5eefc;
-      overflow: auto;
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-      line-height: 1.45;
-      font-size: 13px;
-    }}
-    .actions {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 16px;
-    }}
-    a {{
-      color: var(--accent);
-      text-decoration: none;
-      font-weight: 700;
-    }}
-    .button {{
-      display: inline-flex;
-      align-items: center;
-      min-height: 38px;
-      padding: 8px 14px;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      background: #fff;
-    }}
-    .list {{
-      display: grid;
-      gap: 10px;
-    }}
-    .event {{
-      display: grid;
-      gap: 6px;
-      padding: 12px 14px;
-      background: var(--surface-soft);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-    }}
-    .event-title {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      font-weight: 700;
-    }}
-    .event-body {{
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.45;
-      overflow-wrap: anywhere;
-    }}
-    @media (max-width: 760px) {{
-      main {{ width: min(100% - 20px, 1240px); margin: 12px auto 20px; }}
-      header {{ display: block; }}
-      .split {{ grid-template-columns: 1fr; }}
-      .badge {{ margin-top: 12px; }}
-      .card.metric {{ grid-column: span 6; }}
-    }}
-    @media (max-width: 460px) {{
-      .card.metric {{ grid-column: span 12; }}
-    }}
-  </style>
-</head>
-<body>
-  <main>
-    <header>
-      <div>
-        <h1>Bot quản lý hội viên</h1>
-        <p>Dashboard vận hành cho admin, tự làm mới mỗi 30 giây.</p>
-        <div class="meta">
-          <span class="pill">Render: {html.escape(page_updated_at)}</span>
-          <span class="pill">Nguồn: {html.escape(status_source)}</span>
-          <span class="pill">{html.escape(uptime_hint)}</span>
-        </div>
-      </div>
-      <span class="badge {status_class}">{html.escape(status_text)}</span>
-    </header>
-
-    <section class="grid" aria-label="Thống kê sync">
-      <div class="card metric">
-        <div class="label">Lần sync gần nhất</div>
-        <div class="value">{html.escape(synced_at)}</div>
-        <div class="subvalue">Thời điểm worker cập nhật Google Sheet gần nhất.</div>
-      </div>
-      <div class="card metric">
-        <div class="label">Số dòng đọc</div>
-        <div class="value">{html.escape(rows)}</div>
-        <div class="subvalue">Số dòng dữ liệu phát hiện trong worksheet.</div>
-      </div>
-      <div class="card metric">
-        <div class="label">Dòng đã cập nhật</div>
-        <div class="value">{html.escape(changed_rows)}</div>
-        <div class="subvalue">Các dòng có thay đổi sau lần sync gần nhất.</div>
-      </div>
-      <div class="card metric">
-        <div class="label">Cảnh báo đã gửi</div>
-        <div class="value">{html.escape(alerted_rows)}</div>
-        <div class="subvalue">Số hội viên vừa được nhắc hạn trong lần sync gần nhất.</div>
-      </div>
-    </section>
-
-    <section class="split">
-      <div class="panel">
-        <h2>Chi tiết lần sync</h2>
-        <pre>{detail}</pre>
-      </div>
-      <div class="panel">
-        <h2>Điều khiển nhanh</h2>
-        <div class="list">
-          <div class="event">
-            <div class="event-title">Trạng thái hiện tại</div>
-            <div class="event-body">{html.escape(status_text)}</div>
-          </div>
-          <div class="event">
-            <div class="event-title">Lỗi gần nhất</div>
-            <div class="event-body">{last_error}</div>
-          </div>
-          <div class="event">
-            <div class="event-title">Endpoints</div>
-            <div class="event-body">
-              <a href="/health">/health</a> JSON kỹ thuật<br>
-              <a href="/">/</a> dashboard admin<br>
-              <a href="/admin">/admin</a> dashboard admin
-            </div>
-          </div>
-        </div>
-        <div class="actions">
-          <a class="button" href="/">Làm mới</a>
-          <a class="button" href="/health">Xem JSON</a>
-        </div>
-      </div>
-    </section>
-  </main>
-</body>
-</html>"""
 
 
 def render_member_dashboard(page: int = 1) -> str:
@@ -2458,8 +2413,8 @@ def main() -> None:
     worker.start()
     telegram_worker = threading.Thread(target=telegram_loop, args=(config,), daemon=True)
     telegram_worker.start()
-    telegram_digest_worker = threading.Thread(target=telegram_digest_loop, args=(config,), daemon=True)
-    telegram_digest_worker.start()
+    scheduled_worker = threading.Thread(target=scheduled_loop, args=(config,), daemon=True)
+    scheduled_worker.start()
     uvicorn.run(app, host="127.0.0.1", port=config.port)
 
 
