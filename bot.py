@@ -134,7 +134,6 @@ class MemberSnapshot:
 @dataclass(frozen=True)
 class TelegramReply:
     text: str
-    reply_markup: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -198,6 +197,9 @@ last_sync: dict[str, Any] = {
     "at": None,
     "message": "Bot has not synced yet.",
 }
+STATE_FILE = Path(".bot_state.json")
+state_lock = threading.Lock()
+last_admin_email_digest_date: date | None = None
 sheet_lock = threading.Lock()
 add_sessions: dict[str, AddSession] = {}
 add_sessions_lock = threading.Lock()
@@ -209,6 +211,51 @@ chatid_sessions: set[str] = set()
 chatid_sessions_lock = threading.Lock()
 
 app = FastAPI(title="Hoi Vien Membership Bot")
+
+
+def load_bot_state() -> dict[str, Any]:
+    with state_lock:
+        if not STATE_FILE.exists():
+            return {}
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("Failed to load bot state file")
+            return {}
+
+
+def save_bot_state(state: dict[str, Any]) -> None:
+    with state_lock:
+        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def get_state_dates() -> tuple[date | None, set[str]]:
+    state = load_bot_state()
+    digest_date_text = str(state.get("admin_email_digest_date", "") or "").strip()
+    digest_date = None
+    if digest_date_text:
+        try:
+            digest_date = date.fromisoformat(digest_date_text)
+        except ValueError:
+            logger.warning("Invalid admin_email_digest_date in bot state: %s", digest_date_text)
+    slots = {
+        str(item).strip()
+        for item in state.get("telegram_digest_sent_slots", [])
+        if str(item).strip()
+    }
+    return digest_date, slots
+
+
+def set_state_dates(digest_date: date | None = None, sent_slots: set[str] | None = None) -> None:
+    state = load_bot_state()
+    if digest_date is not None:
+        state["admin_email_digest_date"] = format_date(digest_date)
+    if sent_slots is not None:
+        state["telegram_digest_sent_slots"] = sorted(sent_slots)
+    save_bot_state(state)
+
+
+last_admin_email_digest_date, _ = get_state_dates()
 
 
 def load_config() -> RuntimeConfig:
@@ -656,6 +703,17 @@ def sort_member_snapshots(members: list[MemberSnapshot]) -> list[MemberSnapshot]
     )
 
 
+def sort_members_by_expiry(members: list[MemberSnapshot]) -> list[MemberSnapshot]:
+    return sorted(
+        members,
+        key=lambda member: (
+            member.end_date is None,
+            member.end_date or date.max,
+            member.name.casefold(),
+        ),
+    )
+
+
 def paginate_members(members: list[MemberSnapshot], page: int, per_page: int = 100) -> tuple[list[MemberSnapshot], int]:
     total_pages = max(1, ceil(len(members) / per_page)) if members else 1
     safe_page = min(max(1, page), total_pages)
@@ -965,14 +1023,6 @@ def send_alerts(config: RuntimeConfig, row: dict[str, Any], state: MembershipSta
     sent_channels: list[str] = []
     note = str(row.get("Ghi chú", "") or "")
 
-    for recipient in read_alert_email_recipients():
-        if config.smtp_user and config.smtp_password:
-            try:
-                send_email(config, recipient, member_name, message)
-                sent_channels.append("alert_email")
-            except Exception:
-                logger.exception("Failed to send admin email alert to %s", recipient)
-
     email = extract_note_value(note, "email")
     if email and config.smtp_user and config.smtp_password:
         try:
@@ -1002,6 +1052,30 @@ def send_alerts(config: RuntimeConfig, row: dict[str, Any], state: MembershipSta
     if not sent_channels:
         logger.info("No alert channel configured for member %s", member_name)
     return sent_channels
+
+
+def send_admin_email_digest(config: RuntimeConfig) -> bool:
+    recipients = read_alert_email_recipients()
+    if not recipients:
+        return False
+    if not config.smtp_user or not config.smtp_password:
+        return False
+
+    snapshots = load_member_snapshots(config)
+    expiring_members = filter_expiring_members(snapshots, config.alert_before_days)
+    if not expiring_members:
+        return False
+
+    subject = build_admin_expiring_subject(expiring_members, config.alert_before_days)
+    body = build_admin_expiring_email_body(config, expiring_members, config.alert_before_days)
+    sent = False
+    for recipient in recipients:
+        try:
+            send_email_with_subject(config, recipient, subject, body)
+            sent = True
+        except Exception:
+            logger.exception("Failed to send admin digest email to %s", recipient)
+    return sent
 
 
 def handle_test_alert_command(config: RuntimeConfig, chat_id: str, payload: str) -> str:
@@ -1078,21 +1152,22 @@ def filter_expiring_members(members: list[MemberSnapshot], days: int) -> list[Me
 
 
 def build_admin_expiring_subject(members: list[MemberSnapshot], days: int) -> str:
-    return f"Danh sách hội viên sắp hết hạn trong {days} ngày ({len(members)})"
+    return f"Bao cao hoi vien sap het han - {len(members)} nguoi trong {days} ngay"
 
 
 def build_admin_expiring_email_body(config: RuntimeConfig, members: list[MemberSnapshot], days: int) -> str:
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sheet_url = resolve_google_sheet_url(config)
     lines = [
-        f"DANH SACH HOI VIEN SAP HET HAN TRONG {days} NGAY",
-        f"Thoi diem tao : {generated_at}",
-        f"Tong so       : {len(members)}",
-        f"Google Sheet  : {sheet_url or 'Chua cau hinh GOOGLE_SHEET_URL hoac GOOGLE_SHEET_ID'}",
+        "Bao cao tu dong cho admin.",
+        f"Thoi diem tao: {generated_at}",
+        f"So hoi vien sap het han: {len(members)}",
+        f"Khoang canh bao: {days} ngay",
+        f"Chi tiet du lieu: {sheet_url or 'Chua cau hinh GOOGLE_SHEET_URL hoac GOOGLE_SHEET_ID'}",
         "",
     ]
     if not members:
-        lines.append("Hiện không có hội viên nào sắp hết hạn trong ngưỡng này.")
+        lines.append("Khong co hoi vien nao nam trong nguong canh bao.")
         return "\n".join(lines)
 
     lines.append(
@@ -1197,6 +1272,7 @@ def telegram_set_commands(config: RuntimeConfig) -> None:
         {"command": "senddigest", "description": "Gửi danh sách sắp hết hạn vào group"},
         {"command": "sendstats", "description": "Gửi thống kê hội viên vào group"},
         {"command": "testalert", "description": "Gửi cảnh báo thử"},
+        {"command": "cancel", "description": "Hủy thao tác đang nhập"},
         {"command": "history", "description": "Xem lịch sử gia hạn"},
         {"command": "health", "description": "Kiểm tra trạng thái bot"},
         {"command": "stats", "description": "Xem thống kê hội viên"},
@@ -1250,7 +1326,7 @@ def telegram_loop(config: RuntimeConfig) -> None:
                     continue
                 try:
                     reply = handle_telegram_command(config, chat_id, sender_id or chat_id, text)
-                    telegram_reply(config, chat_id, reply.text, reply.reply_markup)
+                    telegram_reply(config, chat_id, reply.text)
                 except Exception:
                     logger.exception("Failed to handle command from chat_id=%s text=%r", chat_id, text)
                     try:
@@ -1273,30 +1349,29 @@ def handle_telegram_command(config: RuntimeConfig, chat_id: str, sender_id: str,
     if group_chat and command not in GROUP_READ_COMMANDS:
         return TelegramReply(
             "Trong group bot chỉ hỗ trợ xem thông tin và nhận thông báo tự động.\n"
-            "Các lệnh thêm/gia hạn/hủy/cấu hình vui lòng nhắn riêng cho bot bằng tài khoản admin.",
-            telegram_group_menu_markup(),
+            "Các lệnh thêm/gia hạn/hủy/cấu hình vui lòng nhắn riêng cho bot bằng tài khoản admin."
         )
 
     if not group_chat and command == "/cancel":
         if has_email_session(skey):
-            return TelegramReply(cancel_email_session(skey), telegram_menu_markup())
+            return TelegramReply(cancel_email_session(skey))
         if has_chatid_session(skey):
-            return TelegramReply(cancel_chatid_session(skey), telegram_menu_markup())
+            return TelegramReply(cancel_chatid_session(skey))
         if has_renew_session(skey):
-            return TelegramReply(cancel_renew_session(skey), telegram_menu_markup())
-        return TelegramReply(cancel_add_session(skey), telegram_menu_markup())
+            return TelegramReply(cancel_renew_session(skey))
+        return TelegramReply(cancel_add_session(skey))
     if not group_chat and has_email_session(skey):
-        return TelegramReply(handle_email_session_input(config, skey, text), telegram_menu_markup())
+        return TelegramReply(handle_email_session_input(config, skey, text))
     if not group_chat and has_chatid_session(skey):
-        return TelegramReply(handle_chatid_session_input(config, skey, text), telegram_menu_markup())
+        return TelegramReply(handle_chatid_session_input(config, skey, text))
     if not group_chat and has_renew_session(skey):
-        return TelegramReply(handle_renew_session_input(config, skey, text), renew_session_markup(config, skey))
+        return TelegramReply(handle_renew_session_input(config, skey, text))
     if not group_chat and has_add_session(skey):
-        return TelegramReply(handle_add_session_input(config, skey, chat_id, text), add_session_markup(config, skey))
+        return TelegramReply(handle_add_session_input(config, skey, chat_id, text))
     if command == "/start":
-        return TelegramReply(telegram_group_start_text(chat_id) if group_chat else telegram_start_text(chat_id), telegram_group_menu_markup() if group_chat else telegram_menu_markup())
+        return TelegramReply(telegram_group_start_text(chat_id) if group_chat else telegram_start_text(chat_id))
     if command in ("/help", "/menu"):
-        return TelegramReply(telegram_group_help_text(chat_id) if group_chat else telegram_help_text(chat_id), telegram_group_menu_markup() if group_chat else telegram_menu_markup())
+        return TelegramReply(telegram_group_help_text(chat_id) if group_chat else telegram_help_text(chat_id))
     if command == "/id":
         if sender_id and sender_id != chat_id:
             return TelegramReply(
@@ -1310,15 +1385,15 @@ def handle_telegram_command(config: RuntimeConfig, chat_id: str, sender_id: str,
     if command in ("/add", "/them"):
         if group_chat or not is_admin(config, sender_id):
             return TelegramReply(private_admin_required_text(sender_id))
-        return TelegramReply(start_add_session(config, skey), add_session_markup(config, skey))
+        return TelegramReply(start_add_session(config, skey))
     if command in ("/addemail", "/email", "/addalertemail"):
         if group_chat or not is_admin(config, sender_id):
             return TelegramReply(private_admin_required_text(sender_id))
-        return TelegramReply(start_email_session(skey), email_session_markup())
+        return TelegramReply(start_email_session(skey))
     if command in ("/addchatid", "/addgroupid", "/groupid"):
         if group_chat or not is_admin(config, sender_id):
             return TelegramReply(private_admin_required_text(sender_id))
-        return TelegramReply(handle_addchatid_command(config, chat_id, skey, payload), chatid_session_markup() if has_chatid_session(skey) else telegram_menu_markup())
+        return TelegramReply(handle_addchatid_command(config, chat_id, skey, payload))
     if command in ("/testalert", "/test", "/testnotify"):
         if group_chat or not is_admin(config, sender_id):
             return TelegramReply(private_admin_required_text(sender_id))
@@ -1334,7 +1409,7 @@ def handle_telegram_command(config: RuntimeConfig, chat_id: str, sender_id: str,
     if command in ("/renew", "/giahan"):
         if group_chat or not is_admin(config, sender_id):
             return TelegramReply(private_admin_required_text(sender_id))
-        return TelegramReply(handle_renew_command(config, skey, payload), renew_session_markup(config, skey) if has_renew_session(skey) else None)
+        return TelegramReply(handle_renew_command(config, skey, payload))
     if command in ("/huy", "/cancelmember", "/cancelmembership"):
         if group_chat or not is_admin(config, sender_id):
             return TelegramReply(private_admin_required_text(sender_id))
@@ -1422,42 +1497,6 @@ def telegram_group_help_text(chat_id: str) -> str:
         "Group nhận thông báo tự động theo SCHEDULE_RUN_TIMES. Các lệnh /add, /renew, /huy và lệnh cấu hình chỉ dùng trong chat riêng với bot.\n\n"
         f"Group Chat ID: {chat_id}"
     )
-
-
-def telegram_menu_markup() -> dict[str, Any]:
-    return {
-        "keyboard": [
-            [{"text": "/add"}, {"text": "/renew "}],
-            [{"text": "/huy "}],
-            [{"text": "/list"}, {"text": "/active"}],
-            [{"text": "/expiring"}, {"text": "/expired"}],
-            [{"text": "/cancelled"}],
-            [{"text": "/search "}, {"text": "/history "}],
-            [{"text": "/id"}],
-            [{"text": "/addchatid"}, {"text": "/addemail"}],
-            [{"text": "/senddigest"}, {"text": "/sendstats"}],
-            [{"text": "/testalert"}],
-            [{"text": "/health"}, {"text": "/stats"}],
-            [{"text": "/help"}],
-        ],
-        "resize_keyboard": True,
-        "is_persistent": True,
-    }
-
-
-def telegram_group_menu_markup() -> dict[str, Any]:
-    return {
-        "keyboard": [
-            [{"text": "/list"}, {"text": "/active"}],
-            [{"text": "/expiring"}, {"text": "/expired"}],
-            [{"text": "/cancelled"}, {"text": "/stats"}],
-            [{"text": "/search "}, {"text": "/history "}],
-            [{"text": "/id"}, {"text": "/health"}],
-            [{"text": "/help"}],
-        ],
-        "resize_keyboard": True,
-        "is_persistent": True,
-    }
 
 
 def format_telegram_health_text() -> str:
@@ -1574,40 +1613,6 @@ def current_renew_prompt(chat_id: str) -> str:
         field = RENEW_FIELDS[session.field_index]
     skip_note = "" if field.key in ("member_code", "months") else "\nNếu không nhập, hãy gõ dấu chấm (.) để bỏ qua."
     return f"{field.prompt}{skip_note}"
-
-
-def add_session_markup(config: RuntimeConfig, chat_id: str) -> dict[str, Any] | None:
-    with add_sessions_lock:
-        session = add_sessions.get(chat_id)
-        if session is None:
-            return telegram_menu_markup()
-        field = ADD_FIELDS[session.field_index]
-    buttons = [[{"text": "/cancel"}]]
-    return {"keyboard": buttons, "resize_keyboard": True, "one_time_keyboard": False}
-
-
-def renew_session_markup(config: RuntimeConfig, chat_id: str) -> dict[str, Any] | None:
-    with renew_sessions_lock:
-        session = renew_sessions.get(chat_id)
-        if session is None:
-            return telegram_menu_markup()
-    return {"keyboard": [[{"text": "/cancel"}]], "resize_keyboard": True, "one_time_keyboard": False}
-
-
-def email_session_markup() -> dict[str, Any]:
-    return {
-        "keyboard": [[{"text": "/cancel"}]],
-        "resize_keyboard": True,
-        "one_time_keyboard": False,
-    }
-
-
-def chatid_session_markup() -> dict[str, Any]:
-    return {
-        "keyboard": [[{"text": "/cancel"}]],
-        "resize_keyboard": True,
-        "one_time_keyboard": False,
-    }
 
 
 def handle_email_session_input(config: RuntimeConfig, chat_id: str, text: str) -> str:
@@ -1874,7 +1879,7 @@ def is_skip_input(value: str) -> bool:
 
 
 def handle_list_command(config: RuntimeConfig, payload: str) -> str:
-    snapshots = load_member_snapshots(config)
+    snapshots = sort_members_by_expiry(load_member_snapshots(config))
     limit = parse_optional_limit(payload, default=20)
     return format_member_list("Danh sách hội viên", snapshots, limit)
 
@@ -1889,7 +1894,7 @@ def handle_expiring_command(config: RuntimeConfig, payload: str) -> str:
 def handle_status_list_command(config: RuntimeConfig, status: str) -> str:
     snapshots = load_member_snapshots(config)
     filtered = [item for item in snapshots if item.status == status]
-    filtered.sort(key=lambda item: (item.days_remaining if item.days_remaining is not None else 9999, item.name.casefold()))
+    filtered = sort_members_by_expiry(filtered)
     return format_member_list(f"Hội viên {status.lower()}", filtered, 20)
 
 
@@ -1908,7 +1913,7 @@ def handle_search_command(config: RuntimeConfig, payload: str) -> str:
         or needle in item.package.casefold()
         or needle in item.note.casefold()
     ]
-    return format_member_list(f"Kết quả tìm: {query}", filtered, 20)
+    return format_member_list(f"Kết quả tìm: {query}", sort_members_by_expiry(filtered), 20)
 
 
 def handle_stats_command(config: RuntimeConfig) -> str:
@@ -1953,7 +1958,7 @@ def handle_send_stats_command(config: RuntimeConfig) -> str:
         return "Chưa cấu hình TELEGRAM_DIGEST_CHAT_IDS. Vào group Telegram, gửi /id để lấy chat ID rồi điền vào .env."
 
     snapshots = load_member_snapshots(config)
-    message = build_group_stats_message(snapshots)
+    message = build_group_stats_message(config, snapshots)
     sent: list[str] = []
     for chat_id in chat_ids:
         try:
@@ -1985,7 +1990,7 @@ def format_member_list(title: str, members: list[MemberSnapshot], limit: int) ->
     if total == 0:
         return f"{title}: không có dữ liệu."
 
-    lines = [f"{html.escape(title)} ({total})", format_telegram_member_table(members, limit)]
+    lines = [f"<b>{html.escape(title)} ({total})</b>", format_telegram_member_table(members, limit)]
 
     if total > limit:
         lines.append(f"... còn {total - limit} hội viên nữa")
@@ -1993,21 +1998,26 @@ def format_member_list(title: str, members: list[MemberSnapshot], limit: int) ->
 
 
 def format_telegram_member_table(members: list[MemberSnapshot], limit: int) -> str:
-    rows = [
-        f"{'STT':>3} {'Mã':<8} {'Tên':<16} {'Gói':<4} {'Hết hạn':<10} {'Còn lại':<14} {'SĐT':<12}"
-        f"\n{'-' * 3} {'-' * 8} {'-' * 16} {'-' * 4} {'-' * 10} {'-' * 14} {'-' * 12}"
-    ]
+    cards = []
     for index, item in enumerate(members[:limit], start=1):
-        rows.append(
-            f"{index:>3} "
-            f"{fixed_width(item.member_code or '-', 8)} "
-            f"{fixed_width(item.name, 16)} "
-            f"{fixed_width(item.package or '-', 4)} "
-            f"{fixed_width(format_date(item.end_date) or '-', 10)} "
-            f"{fixed_width(item.remaining or '-', 14)} "
-            f"{fixed_width(item.phone or '-', 12)}"
-        )
-    return "<pre>" + html.escape("\n".join(rows)) + "</pre>"
+        cards.append(format_telegram_member_card(index, item))
+    return "\n\n".join(cards)
+
+
+def format_telegram_member_card(index: int, member: MemberSnapshot) -> str:
+    code = html.escape(member.member_code or "-")
+    name = html.escape(member.name or "-")
+    package = html.escape(member.package or "-")
+    end_date = html.escape(format_date(member.end_date) or "-")
+    remaining = html.escape(member.remaining or "-")
+    status = html.escape(member.status or "-")
+    phone = html.escape(member.phone or "-")
+    return (
+        f"<b>{index}. {name}</b>\n"
+        f"Mã: {code} | Gói: {package}\n"
+        f"Hạn: {end_date} | Còn: {remaining}\n"
+        f"TT: {status} | SĐT: {phone}"
+    )
 
 
 def render_history_table_body(rows: list[dict[str, Any]]) -> str:
@@ -2045,14 +2055,14 @@ def send_discord(webhook_url: str, message: str) -> None:
     response.raise_for_status()
 
 
-def telegram_reply(config: RuntimeConfig, chat_id: str, text: str, reply_markup: dict[str, Any] | None = None) -> None:
+def telegram_reply(config: RuntimeConfig, chat_id: str, text: str) -> None:
     use_html = "<pre>" in text or "<b>" in text
-    for index, chunk in enumerate(split_telegram_message(text)):
+    for chunk in split_telegram_message(text):
         payload: dict[str, Any] = {"chat_id": chat_id, "text": chunk}
         if use_html:
             payload["parse_mode"] = "HTML"
-        if index == 0 and reply_markup:
-            payload["reply_markup"] = reply_markup
+        if not is_group_chat(chat_id):
+            payload["reply_markup"] = {"remove_keyboard": True, "selective": True}
         telegram_api(config, "sendMessage", payload)
 
 
@@ -2085,19 +2095,36 @@ def worker_loop(config: RuntimeConfig) -> None:
             result = sync_sheet(config)
             last_sync.update({"ok": True, "at": datetime.now().isoformat(timespec="seconds"), "message": result})
             logger.info("Sync completed: %s", result)
+            maybe_send_admin_email_digest(config)
         except Exception as exc:
             last_sync.update({"ok": False, "at": datetime.now().isoformat(timespec="seconds"), "message": str(exc)})
             logger.exception("Sync failed")
         time.sleep(max(1, config.check_interval_minutes) * 60)
 
 
-def build_group_stats_message(members: list[MemberSnapshot]) -> str:
+def maybe_send_admin_email_digest(config: RuntimeConfig) -> None:
+    global last_admin_email_digest_date
+    if not read_alert_email_recipients():
+        return
+    now = datetime.now()
+    today = now.date()
+    if last_admin_email_digest_date == today:
+        return
+    if not is_alert_time(config, now.time()):
+        return
+    if send_admin_email_digest(config):
+        last_admin_email_digest_date = today
+        set_state_dates(digest_date=today)
+
+
+def build_group_stats_message(config: RuntimeConfig, members: list[MemberSnapshot]) -> str:
     total = len(members)
     active = sum(1 for m in members if m.status == "Còn hạn")
     expiring = sum(1 for m in members if m.status == "Sắp hết hạn")
     expired = sum(1 for m in members if m.status == "Hết hạn")
     cancelled = sum(1 for m in members if m.status == "Đã hủy")
-    return (
+    sheet_url = resolve_google_sheet_url(config)
+    message = (
         f"Thống kê hội viên - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
         f"- Tổng: {total}\n"
         f"- Còn hạn: {active}\n"
@@ -2105,6 +2132,9 @@ def build_group_stats_message(members: list[MemberSnapshot]) -> str:
         f"- Hết hạn: {expired}\n"
         f"- Đã hủy: {cancelled}"
     )
+    if sheet_url:
+        message = f"{message}\n\nChi tiết: {sheet_url}"
+    return message
 
 
 def scheduled_loop(config: RuntimeConfig) -> None:
@@ -2115,7 +2145,15 @@ def scheduled_loop(config: RuntimeConfig) -> None:
         logger.info("SCHEDULE_RUN_TIMES is empty; scheduled tasks disabled.")
         return
 
+    _, persisted_slots = get_state_dates()
     sent_slots: set[tuple[date, datetime_time]] = set()
+    for raw_slot in persisted_slots:
+        try:
+            day_text, time_text = raw_slot.split("|", 1)
+            sent_slots.add((parse_date(day_text), datetime.strptime(time_text, "%H:%M").time()))  # type: ignore[arg-type]
+        except Exception:
+            continue
+    sent_slots = {slot for slot in sent_slots if slot[0] is not None}
     logger.info(
         "Scheduled tasks at %s. Telegram group IDs are read from TELEGRAM_DIGEST_CHAT_IDS.",
         ", ".join(t.strftime("%H:%M") for t in config.schedule_run_times),
@@ -2129,12 +2167,18 @@ def scheduled_loop(config: RuntimeConfig) -> None:
             now = datetime.now()
             today = now.date()
             sent_slots = {slot for slot in sent_slots if slot[0] == today}
+            persisted_today_slots = {
+                f"{slot[0].isoformat()}|{slot[1].strftime('%H:%M')}"
+                for slot in sent_slots
+                if slot[0] == today
+            }
+            set_state_dates(sent_slots=persisted_today_slots)
             for run_time in config.schedule_run_times:
                 slot = (today, run_time)
                 if slot in sent_slots or now.time() < run_time:
                     continue
                 snapshots = load_member_snapshots(config)
-                stats_msg = build_group_stats_message(snapshots)
+                stats_msg = build_group_stats_message(config, snapshots)
                 expiring = filter_expiring_members(snapshots, config.telegram_digest_days)
                 digest_msg = build_telegram_expiring_digest(expiring, config.telegram_digest_days)
                 for chat_id in chat_ids:
@@ -2144,6 +2188,7 @@ def scheduled_loop(config: RuntimeConfig) -> None:
                     except Exception:
                         logger.exception("Failed to send scheduled tasks to chat_id=%s", chat_id)
                 sent_slots.add(slot)
+                set_state_dates(sent_slots={f"{slot[0].isoformat()}|{slot[1].strftime('%H:%M')}" for slot in sent_slots if slot[0] == today})
                 logger.info("Scheduled tasks sent for slot %s", slot)
         except Exception:
             logger.exception("Scheduled loop failed")

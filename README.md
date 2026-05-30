@@ -161,6 +161,7 @@ Trong group Telegram:
 - `/id`: xem group chat ID và user ID của người gửi.
 - `/list`, `/active`, `/expiring`, `/expired`, `/cancelled`, `/search`, `/stats`: xem thông tin hội viên ngay trong group.
 - Bot tự gửi thống kê và danh sách sắp hết hạn vào group theo `SCHEDULE_RUN_TIMES`.
+- Dashboard web là nơi xem đầy đủ; Telegram chỉ nên dùng cho tra nhanh và nhận thông báo.
 
 Group không xử lý `/add`, `/renew`, `/huy` hoặc các lệnh cấu hình/test. Các lệnh đó phải nhắn riêng cho bot bằng tài khoản admin đã cấu hình.
 

@@ -126,7 +126,7 @@ def test_admin_expiring_email_body_lists_members():
     config = RuntimeConfig(google_service_account_json="credentials.json", google_sheet_url="https://docs.google.com/spreadsheets/d/test/edit")
     subject = build_admin_expiring_subject([member], 3)
     body = build_admin_expiring_email_body(config, [member], 3)
-    assert subject == "Danh sách hội viên sắp hết hạn trong 3 ngày (1)"
+    assert subject == "Bao cao hoi vien sap het han - 1 nguoi trong 3 ngay"
     assert "Nguyen Van A" in body
     assert "2026-06-01" in body
     assert "https://docs.google.com/spreadsheets/d/test/edit" in body
@@ -254,13 +254,13 @@ def test_format_member_list_limits_rows_and_shows_total():
     assert "còn 1 hội viên nữa" in text
 
 
-def test_format_telegram_member_table_uses_preformatted_table():
+def test_format_telegram_member_table_uses_mobile_cards():
     members = [
         MemberSnapshot(2, "Nguyen Van A", "3", "0909", "", "", "", date(2026, 5, 29), date(2026, 8, 29), "Còn hạn", "3 tháng", 92, ""),
     ]
     text = format_telegram_member_table(members, limit=1)
-    assert text.startswith("<pre>")
-    assert "Hết hạn" in text
+    assert text.startswith("<b>1. Nguyen Van A</b>")
+    assert "Hạn: 2026-08-29" in text
     assert "Nguyen Van A" in text
 
 

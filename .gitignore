@@ -8,3 +8,4 @@ pytest-cache-files-*/
 
 .venv/
 .idea/
+.bot_state.json
