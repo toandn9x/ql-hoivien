@@ -29,8 +29,10 @@ from bot import (
     parse_alert_run_time,
     parse_pipe_payload,
     parse_required_add_fields,
+    read_schedule_run_times,
     paginate_members,
     sort_member_snapshots,
+    send_scheduled_telegram_messages,
     should_alert,
     split_telegram_message,
     start_add_session,
@@ -83,6 +85,16 @@ def test_parse_pipe_payload_trims_fields():
 def test_parse_alert_run_time_supports_empty_or_hh_mm():
     assert parse_alert_run_time("") is None
     assert parse_alert_run_time("09:30") == time(9, 30)
+
+
+def test_read_schedule_run_times_reloads_env_file(monkeypatch):
+    with TemporaryDirectory(dir="C:\\tmp") as temp_dir:
+        env_file = Path(temp_dir) / ".env"
+        env_file.write_text("SCHEDULE_RUN_TIMES=07:00,18:00\n", encoding="utf-8")
+        monkeypatch.chdir(temp_dir)
+        monkeypatch.delenv("SCHEDULE_RUN_TIMES", raising=False)
+
+        assert read_schedule_run_times() == (time(7, 0), time(18, 0))
 
 
 def test_is_alert_time_respects_configured_time():
@@ -295,3 +307,25 @@ def test_render_history_table_body_renders_rows():
 
 def test_split_telegram_message_preserves_short_text():
     assert split_telegram_message("abc", limit=10) == ["abc"]
+
+
+def test_send_scheduled_telegram_messages_retries_failed_message(monkeypatch):
+    calls: list[str] = []
+    digest_attempts = 0
+
+    def fake_telegram_reply(config: RuntimeConfig, chat_id: str, text: str) -> None:
+        nonlocal digest_attempts
+        if text == "digest":
+            digest_attempts += 1
+            if digest_attempts == 1:
+                raise RuntimeError("temporary telegram failure")
+        calls.append(text)
+
+    monkeypatch.setattr("bot.telegram_reply", fake_telegram_reply)
+    monkeypatch.setattr("bot.time.sleep", lambda seconds: None)
+    monkeypatch.setenv("SCHEDULE_RETRY_ATTEMPTS", "2")
+    monkeypatch.setenv("SCHEDULE_RETRY_DELAY_SECONDS", "1")
+
+    config = RuntimeConfig(google_service_account_json="credentials.json")
+    assert send_scheduled_telegram_messages(config, "-1001", ("stats", "digest"))
+    assert calls == ["stats", "digest"]

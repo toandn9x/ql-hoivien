@@ -136,11 +136,15 @@ Nếu muốn gửi thông báo tự động vào group Telegram, thêm bot vào 
 ```env
 TELEGRAM_DIGEST_CHAT_IDS=-1001234567890
 SCHEDULE_RUN_TIMES=07:00,18:00
+SCHEDULE_RETRY_ATTEMPTS=3
+SCHEDULE_RETRY_DELAY_SECONDS=10
 TELEGRAM_DIGEST_DAYS=3
 ```
 
 - `TELEGRAM_DIGEST_CHAT_IDS`: chat ID group nhận thông báo, có thể nhập nhiều ID bằng dấu phẩy.
 - `SCHEDULE_RUN_TIMES`: các giờ gửi thông báo trong ngày, dạng `HH:MM`, cách nhau bằng dấu phẩy. Ví dụ `07:00,18:00` để gửi lúc 7 giờ sáng và 6 giờ chiều. Để trống nếu không muốn gửi tự động.
+- `SCHEDULE_RETRY_ATTEMPTS`: số lần thử gửi lại khi Telegram lỗi, mặc định `3`.
+- `SCHEDULE_RETRY_DELAY_SECONDS`: số giây chờ giữa các lần retry, mặc định `10`.
 - `TELEGRAM_DIGEST_DAYS`: số ngày nhìn trước để lọc hội viên sắp hết hạn.
 
 Admin cũng có thể nhắn riêng cho bot để thêm group nhận thông báo:

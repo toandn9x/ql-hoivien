@@ -26,10 +26,52 @@ from google.oauth2.service_account import Credentials
 
 load_dotenv()
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+
+class DailyFileHandler(logging.Handler):
+    """Ghi log vào log/YYYY_MM_DD.txt, tự tạo file mới mỗi ngày."""
+
+    def __init__(self, log_dir: str = "log") -> None:
+        super().__init__()
+        self._log_dir = Path(log_dir)
+        self._current_date: date | None = None
+        self._stream: Any = None
+        self._file_lock = threading.Lock()
+
+    def _rotate_if_needed(self) -> None:
+        today = date.today()
+        if self._current_date == today:
+            return
+        if self._stream:
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+        self._log_dir.mkdir(parents=True, exist_ok=True)
+        path = self._log_dir / today.strftime("%Y_%m_%d.txt")
+        self._stream = open(path, "a", encoding="utf-8")
+        self._current_date = today
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            with self._file_lock:
+                self._rotate_if_needed()
+                self._stream.write(msg + "\n")
+                self._stream.flush()
+        except Exception:
+            self.handleError(record)
+
+
+_log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+_log_format = "%(asctime)s %(levelname)s %(name)s %(message)s"
+
+logging.basicConfig(level=_log_level, format=_log_format)
+
+_file_handler = DailyFileHandler("log")
+_file_handler.setLevel(logging.INFO)
+_file_handler.setFormatter(logging.Formatter(_log_format))
+logging.getLogger().addHandler(_file_handler)
+
 logger = logging.getLogger("membership-bot")
 
 WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME", "HoiVien")
@@ -301,6 +343,30 @@ def read_alert_email_recipients() -> tuple[str, ...]:
 
 def read_telegram_digest_chat_ids() -> tuple[str, ...]:
     return parse_csv_value(os.getenv("TELEGRAM_DIGEST_CHAT_IDS", ""))
+
+
+def read_schedule_run_times() -> tuple[datetime_time, ...]:
+    load_dotenv(override=True)
+    return parse_run_times(os.getenv("SCHEDULE_RUN_TIMES", ""))
+
+
+def read_schedule_retry_attempts() -> int:
+    try:
+        return max(1, int(os.getenv("SCHEDULE_RETRY_ATTEMPTS", "3")))
+    except ValueError:
+        logger.warning("Invalid SCHEDULE_RETRY_ATTEMPTS, using default: %s", os.getenv("SCHEDULE_RETRY_ATTEMPTS"))
+        return 3
+
+
+def read_schedule_retry_delay_seconds() -> int:
+    try:
+        return max(1, int(os.getenv("SCHEDULE_RETRY_DELAY_SECONDS", "10")))
+    except ValueError:
+        logger.warning(
+            "Invalid SCHEDULE_RETRY_DELAY_SECONDS, using default: %s",
+            os.getenv("SCHEDULE_RETRY_DELAY_SECONDS"),
+        )
+        return 10
 
 
 def parse_csv_value(value: str) -> tuple[str, ...]:
@@ -1504,9 +1570,16 @@ def format_telegram_health_text() -> str:
     at = last_sync.get("at") or "chưa có lần sync nào"
     ok = last_sync.get("ok")
     bot_status = "OK" if ok is True else "Lỗi" if ok is False else "Chưa sync"
+    _, sent_slots = get_state_dates()
+    schedule_times = read_schedule_run_times()
+    schedule_text = ", ".join(t.strftime("%H:%M") for t in schedule_times) or "chưa cấu hình"
+    today_prefix = f"{date.today().isoformat()}|"
+    sent_today = ", ".join(slot.split("|", 1)[1] for slot in sorted(sent_slots) if slot.startswith(today_prefix)) or "chưa có"
     return (
         f"Bot: {bot_status}\n"
         f"Sync gần nhất: {at}\n"
+        f"Lịch gửi: {schedule_text}\n"
+        f"Đã gửi hôm nay: {sent_today}\n"
         f"Trạng thái: {status}"
     )
 
@@ -2137,59 +2210,126 @@ def build_group_stats_message(config: RuntimeConfig, members: list[MemberSnapsho
     return message
 
 
+def send_scheduled_telegram_messages(config: RuntimeConfig, chat_id: str, messages: tuple[str, ...]) -> bool:
+    attempts = read_schedule_retry_attempts()
+    delay_seconds = read_schedule_retry_delay_seconds()
+    for message_index, message in enumerate(messages, start=1):
+        for attempt in range(1, attempts + 1):
+            try:
+                telegram_reply(config, chat_id, message)
+                break
+            except Exception:
+                if attempt >= attempts:
+                    logger.exception(
+                        "Failed scheduled Telegram message %s/%s to chat_id=%s after %s attempts",
+                        message_index,
+                        len(messages),
+                        chat_id,
+                        attempts,
+                    )
+                    return False
+                logger.warning(
+                    "Retrying scheduled Telegram message %s/%s to chat_id=%s, attempt %s/%s",
+                    message_index,
+                    len(messages),
+                    chat_id,
+                    attempt + 1,
+                    attempts,
+                )
+                time.sleep(delay_seconds)
+    return True
+
+
+def _load_sent_slot_keys(persisted_slots: set[str]) -> set[tuple[date, datetime_time, str]]:
+    keys: set[tuple[date, datetime_time, str]] = set()
+    for raw in persisted_slots:
+        parts = raw.split("|", 2)
+        if len(parts) < 2:
+            continue
+        try:
+            d = parse_date(parts[0])
+            t = datetime.strptime(parts[1], "%H:%M").time()
+            chat_id = parts[2] if len(parts) > 2 else ""
+            if d:
+                keys.add((d, t, chat_id))
+        except Exception:
+            continue
+    return keys
+
+
+def _persist_slot_keys(keys: set[tuple[date, datetime_time, str]], today: date) -> None:
+    today_raw = {
+        f"{k[0].isoformat()}|{k[1].strftime('%H:%M')}|{k[2]}"
+        for k in keys
+        if k[0] == today
+    }
+    set_state_dates(sent_slots=today_raw)
+
+
 def scheduled_loop(config: RuntimeConfig) -> None:
     if not config.telegram_bot_token:
         logger.info("Telegram bot token is empty; scheduled tasks disabled.")
         return
-    if not config.schedule_run_times:
+    configured_run_times = read_schedule_run_times() or config.schedule_run_times
+    if not configured_run_times:
         logger.info("SCHEDULE_RUN_TIMES is empty; scheduled tasks disabled.")
         return
 
     _, persisted_slots = get_state_dates()
-    sent_slots: set[tuple[date, datetime_time]] = set()
-    for raw_slot in persisted_slots:
-        try:
-            day_text, time_text = raw_slot.split("|", 1)
-            sent_slots.add((parse_date(day_text), datetime.strptime(time_text, "%H:%M").time()))  # type: ignore[arg-type]
-        except Exception:
-            continue
-    sent_slots = {slot for slot in sent_slots if slot[0] is not None}
+    sent_keys: set[tuple[date, datetime_time, str]] = _load_sent_slot_keys(persisted_slots)
     logger.info(
         "Scheduled tasks at %s. Telegram group IDs are read from TELEGRAM_DIGEST_CHAT_IDS.",
-        ", ".join(t.strftime("%H:%M") for t in config.schedule_run_times),
+        ", ".join(t.strftime("%H:%M") for t in configured_run_times),
     )
+
+    # Catch-up check on startup: log any missed slots from today
+    _startup_chat_ids = read_telegram_digest_chat_ids() or config.telegram_digest_chat_ids
+    _now = datetime.now()
+    _today = _now.date()
+    _missed = [
+        rt for rt in configured_run_times
+        if _now.time() >= rt
+        and any((_today, rt, cid) not in sent_keys for cid in _startup_chat_ids)
+    ]
+    if _missed:
+        logger.info(
+            "Bot restarted — will catch up on %d missed slot(s) this cycle: %s",
+            len(_missed),
+            ", ".join(rt.strftime("%H:%M") for rt in _missed),
+        )
+    else:
+        logger.info("Bot started — all scheduled slots for today are up to date.")
+
     while True:
         try:
+            configured_run_times = read_schedule_run_times() or config.schedule_run_times
+            if not configured_run_times:
+                time.sleep(60)
+                continue
             chat_ids = read_telegram_digest_chat_ids() or config.telegram_digest_chat_ids
             if not chat_ids:
                 time.sleep(60)
                 continue
             now = datetime.now()
             today = now.date()
-            sent_slots = {slot for slot in sent_slots if slot[0] == today}
-            persisted_today_slots = {
-                f"{slot[0].isoformat()}|{slot[1].strftime('%H:%M')}"
-                for slot in sent_slots
-                if slot[0] == today
-            }
-            set_state_dates(sent_slots=persisted_today_slots)
-            for run_time in config.schedule_run_times:
-                slot = (today, run_time)
-                if slot in sent_slots or now.time() < run_time:
+            sent_keys = {k for k in sent_keys if k[0] == today}
+            for run_time in configured_run_times:
+                if now.time() < run_time:
+                    continue
+                pending = [cid for cid in chat_ids if (today, run_time, cid) not in sent_keys]
+                if not pending:
                     continue
                 snapshots = load_member_snapshots(config)
                 stats_msg = build_group_stats_message(config, snapshots)
                 expiring = filter_expiring_members(snapshots, config.telegram_digest_days)
                 digest_msg = build_telegram_expiring_digest(expiring, config.telegram_digest_days)
-                for chat_id in chat_ids:
-                    try:
-                        telegram_reply(config, chat_id, stats_msg)
-                        telegram_reply(config, chat_id, digest_msg)
-                    except Exception:
-                        logger.exception("Failed to send scheduled tasks to chat_id=%s", chat_id)
-                sent_slots.add(slot)
-                set_state_dates(sent_slots={f"{slot[0].isoformat()}|{slot[1].strftime('%H:%M')}" for slot in sent_slots if slot[0] == today})
-                logger.info("Scheduled tasks sent for slot %s", slot)
+                for chat_id in pending:
+                    if send_scheduled_telegram_messages(config, chat_id, (stats_msg, digest_msg)):
+                        sent_keys.add((today, run_time, chat_id))
+                        _persist_slot_keys(sent_keys, today)
+                        logger.info("Scheduled slot %s sent to chat_id=%s", run_time.strftime("%H:%M"), chat_id)
+                    else:
+                        logger.warning("Scheduled slot %s failed for chat_id=%s — will retry next cycle", run_time.strftime("%H:%M"), chat_id)
         except Exception:
             logger.exception("Scheduled loop failed")
         time.sleep(60)
@@ -2197,7 +2337,18 @@ def scheduled_loop(config: RuntimeConfig) -> None:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "last_sync": last_sync}
+    _, sent_slots = get_state_dates()
+    schedule_times = read_schedule_run_times()
+    return {
+        "status": "ok",
+        "last_sync": last_sync,
+        "schedule": {
+            "run_times": [run_time.strftime("%H:%M") for run_time in schedule_times],
+            "sent_slots": sorted(sent_slots),
+            "retry_attempts": read_schedule_retry_attempts(),
+            "retry_delay_seconds": read_schedule_retry_delay_seconds(),
+        },
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2460,7 +2611,8 @@ def main() -> None:
     telegram_worker.start()
     scheduled_worker = threading.Thread(target=scheduled_loop, args=(config,), daemon=True)
     scheduled_worker.start()
-    uvicorn.run(app, host="127.0.0.1", port=config.port)
+    host = os.getenv("HOST", "127.0.0.1")
+    uvicorn.run(app, host=host, port=config.port)
 
 
 if __name__ == "__main__":
