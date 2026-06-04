@@ -2165,14 +2165,20 @@ def split_telegram_message(text: str, limit: int = 3500) -> list[str]:
 def worker_loop(config: RuntimeConfig) -> None:
     while True:
         try:
-            result = sync_sheet(config)
-            last_sync.update({"ok": True, "at": datetime.now().isoformat(timespec="seconds"), "message": result})
-            logger.info("Sync completed: %s", result)
+            record_sheet_sync(config, "worker")
             maybe_send_admin_email_digest(config)
         except Exception as exc:
             last_sync.update({"ok": False, "at": datetime.now().isoformat(timespec="seconds"), "message": str(exc)})
             logger.exception("Sync failed")
         time.sleep(max(1, config.check_interval_minutes) * 60)
+
+
+def record_sheet_sync(config: RuntimeConfig, source: str) -> dict[str, Any]:
+    result = sync_sheet(config)
+    result["source"] = source
+    last_sync.update({"ok": True, "at": datetime.now().isoformat(timespec="seconds"), "message": result})
+    logger.info("Sync completed from %s: %s", source, result)
+    return result
 
 
 def maybe_send_admin_email_digest(config: RuntimeConfig) -> None:
@@ -2319,6 +2325,8 @@ def scheduled_loop(config: RuntimeConfig) -> None:
                 pending = [cid for cid in chat_ids if (today, run_time, cid) not in sent_keys]
                 if not pending:
                     continue
+                sync_result = record_sheet_sync(config, f"schedule:{run_time.strftime('%H:%M')}")
+                logger.info("Sheet synced before scheduled slot %s: %s", run_time.strftime("%H:%M"), sync_result)
                 snapshots = load_member_snapshots(config)
                 stats_msg = build_group_stats_message(config, snapshots)
                 expiring = filter_expiring_members(snapshots, config.telegram_digest_days)
