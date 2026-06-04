@@ -1784,22 +1784,22 @@ def add_csv_value_to_env(key: str, value: str) -> str:
     return merge_csv_values(existing_value, value)
 
 
-def handle_add_session_input(config: RuntimeConfig, chat_id: str, text: str) -> str:
+def handle_add_session_input(config: RuntimeConfig, session_key: str, telegram_chat_id: str, text: str) -> str:
     raw_value = text
     with add_sessions_lock:
-        session = add_sessions.get(chat_id)
+        session = add_sessions.get(session_key)
         if session is None:
             return "Gõ /add để bắt đầu thêm hội viên."
         field = ADD_FIELDS[session.field_index]
 
     value = "" if is_skip_input(raw_value) else raw_value.strip()
     if field.key in config.telegram_add_required_fields and not value:
-        return f"{field.label} là bắt buộc.\n\n{current_add_prompt(config, chat_id)}"
+        return f"{field.label} là bắt buộc.\n\n{current_add_prompt(config, session_key)}"
     if field.key == "months" and value and parse_months(value) is None:
-        return f"Gói đăng ký phải là số tháng hợp lệ.\n\n{current_add_prompt(config, chat_id)}"
+        return f"Gói đăng ký phải là số tháng hợp lệ.\n\n{current_add_prompt(config, session_key)}"
 
     with add_sessions_lock:
-        session = add_sessions.get(chat_id)
+        session = add_sessions.get(session_key)
         if session is None:
             return "Gõ /add để bắt đầu thêm hội viên."
         session.values[field.key] = value
@@ -1809,7 +1809,7 @@ def handle_add_session_input(config: RuntimeConfig, chat_id: str, text: str) -> 
             skip_note = "" if next_field.key in config.telegram_add_required_fields else "\nNếu không nhập, hãy gõ dấu chấm (.) để bỏ qua."
             return f"Đã lưu {field.label}.\n\n{next_field.prompt}{skip_note}"
         values = session.values.copy()
-        add_sessions.pop(chat_id, None)
+        add_sessions.pop(session_key, None)
 
     member_name = values.get("member_name", "")
     months = values.get("months", "")
@@ -1822,7 +1822,7 @@ def handle_add_session_input(config: RuntimeConfig, chat_id: str, text: str) -> 
         values.get("source", ""),
         values.get("amount", ""),
         values.get("transaction_name", ""),
-        chat_id,
+        telegram_chat_id,
         values.get("note", ""),
     )
     return (
